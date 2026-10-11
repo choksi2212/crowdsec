@@ -481,7 +481,11 @@ func NewParsedRequestFromRequest(r *http.Request, logger *log.Entry, bodySetting
 		BodySizeExceeded:     bodySizeExceeded,
 		Args:                 exprhelpers.ParseQuery(parsedURL.RawQuery),
 		TransferEncoding:     r.TransferEncoding,
-		ResponseChannel:      make(chan AppsecTempResponse),
+		// Buffered so the runner's response send never blocks: the HTTP
+		// handler may abandon its wait when the source is shutting down
+		// (SIGHUP reload). Each request is answered exactly once, so a
+		// buffer of one always drains.
+		ResponseChannel:      make(chan AppsecTempResponse, 1),
 		RemoteAddrNormalized: normalizeRemoteAddr(r.RemoteAddr),
 		HTTPRequest:          originalHTTPRequest,
 	}, nil

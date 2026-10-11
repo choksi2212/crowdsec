@@ -20,6 +20,10 @@ import (
 )
 
 func (w *Source) listenAndServe(ctx context.Context, t *tomb.Tomb) error {
+	if w.stopChan == nil {
+		w.stopChan = make(chan struct{})
+	}
+
 	w.logger.Infof("%d appsec runner to start", len(w.AppsecRunners))
 
 	serverError := make(chan error, 2)
@@ -101,8 +105,24 @@ func (w *Source) listenAndServe(ctx context.Context, t *tomb.Tomb) error {
 		// xx let's clean up the appsec runners :)
 		appsec.AppsecRulesDetails = make(map[int]appsec.RulesDetails)
 
-		if err := w.server.Shutdown(ctx); err != nil {
+		// Abort in-flight requests first: the runners are gone, so anything
+		// still waiting on InChan or on a response would otherwise block the
+		// server-wide graceful stop forever and hang the whole reload.
+		close(w.stopChan)
+
+		// Bound the graceful stop: the handler aborts on the closed stopChan,
+		// but anything still wedged after the grace period must not hang the
+		// reload. Fall back to force-closing the connections so the listener
+		// is always released for the next generation to re-bind.
+		stopCtx, cancel := context.WithTimeout(ctx, appsecStopGrace)
+		defer cancel()
+
+		if err := w.server.Shutdown(stopCtx); err != nil {
 			w.logger.Errorf("Error shutting down Appsec server: %s", err.Error())
+
+			if closeErr := w.server.Close(); closeErr != nil {
+				w.logger.Errorf("Error force-closing Appsec server: %s", closeErr.Error())
+			}
 		}
 
 		if w.AppsecRuntime != nil && w.AppsecRuntime.ChallengeRuntime != nil {

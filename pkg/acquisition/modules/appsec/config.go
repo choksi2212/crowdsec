@@ -38,6 +38,13 @@ var (
 	DefaultBodyReadTimeout   = (1 * time.Second)
 )
 
+// appsecStopGrace bounds how long the server-wide graceful stop waits for
+// in-flight requests to return during a reload before the connections are
+// force-closed. The handler aborts on the closed stopChan, so anything still
+// wedged after this window is waiting on a runner that has already exited
+// and will never answer.
+const appsecStopGrace = 10 * time.Second
+
 // configuration structure of the acquis for the application security engine
 type Configuration struct {
 	ListenAddr        string         `yaml:"listen_addr"`
@@ -235,6 +242,7 @@ func (w *Source) Configure(ctx context.Context, yamlConfig []byte, logger *log.E
 	w.server.Protocols.SetHTTP2(true)
 
 	w.InChan = make(chan appsec.ParsedRequest)
+	w.stopChan = make(chan struct{})
 	appsecCfg := appsec.AppsecConfig{Logger: w.logger.WithField("component", "appsec_config")}
 
 	// we keep the datasource name
@@ -470,13 +478,33 @@ func (w *Source) appsecHandler(rw http.ResponseWriter, r *http.Request) {
 
 	metrics.AppsecReqCounter.With(prometheus.Labels{"source": parsedRequest.RemoteAddrNormalized, "appsec_engine": parsedRequest.AppsecEngine}).Inc()
 
-	w.InChan <- parsedRequest
+	// The send to the runners and the wait for the response are both guarded
+	// against the source stopping (stopChan is closed when the tomb starts
+	// dying, e.g. on a SIGHUP reload). Without the guard, a request that no
+	// runner will ever service blocks the send on the unbuffered InChan (or
+	// the wait on the response channel) forever, so the server-wide graceful
+	// stop never returns and the reload hangs with every datasource stopped.
+	// The bouncer gets a 503 and retries against the freshly reloaded source.
+	select {
+	case w.InChan <- parsedRequest:
+	case <-w.stopChan:
+		w.logger.Errorf("Appsec shutting down, aborting request %s before it reached a runner", parsedRequest.UUID)
+		rw.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
 
 	/*
 		response is a copy of w.AppSecRuntime.Response that is safe to use.
 		As OutOfBand might still be running, the original one can be modified
 	*/
-	response := <-parsedRequest.ResponseChannel
+	var response appsec.AppsecTempResponse
+	select {
+	case response = <-parsedRequest.ResponseChannel:
+	case <-w.stopChan:
+		w.logger.Errorf("Appsec shutting down, aborting request %s while waiting for its response", parsedRequest.UUID)
+		rw.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
 
 	if response.InBandInterrupt {
 		metrics.AppsecBlockCounter.With(prometheus.Labels{"source": parsedRequest.RemoteAddrNormalized, "appsec_engine": parsedRequest.AppsecEngine}).Inc()

@@ -16,14 +16,21 @@ import (
 )
 
 type Source struct {
-	config                Configuration
-	hub                   *cwhub.Hub
-	lapiClientConfig      *csconfig.LocalApiClientCfg
-	logger                *log.Entry
-	mux                   *http.ServeMux
-	server                *http.Server
-	InChan                chan appsec.ParsedRequest
-	AppsecRuntime         *appsec.AppsecRuntimeConfig
+	config           Configuration
+	hub              *cwhub.Hub
+	lapiClientConfig *csconfig.LocalApiClientCfg
+	logger           *log.Entry
+	mux              *http.ServeMux
+	server           *http.Server
+	InChan           chan appsec.ParsedRequest
+	AppsecRuntime    *appsec.AppsecRuntimeConfig
+
+	// stopChan is closed once when the source starts dying (SIGHUP reload or
+	// full stop). The HTTP handler selects on it so requests no runner will
+	// ever service are aborted instead of blocking the unbuffered InChan (or
+	// the response wait) forever, which would hang the server-wide graceful
+	// stop and with it the whole reload.
+	stopChan              chan struct{}
 	AppsecConfigs         map[string]appsec.AppsecConfig
 	lapiURL               string
 	AuthCache             AuthCache
