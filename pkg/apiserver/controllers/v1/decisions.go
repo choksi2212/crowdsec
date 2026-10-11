@@ -155,10 +155,32 @@ func (c *Controller) DeleteDecisions(gctx *gin.Context) {
 	gctx.JSON(http.StatusOK, deleteDecisionResp)
 }
 
+// firstDecisionsPage runs the first page query of an array without writing anything, so a
+// database failure is caught before the streaming response is committed.
+type decisionsQuery func(ctx context.Context, now time.Time, filters map[string][]string) ([]*ent.Decision, error)
+
+func firstDecisionsPage(ctx context.Context, now time.Time,
+	filters map[string][]string, startID int, limit int, query decisionsQuery,
+) ([]*ent.Decision, error) {
+	filters["limit"] = []string{strconv.Itoa(limit)}
+	// the filters map is reused across calls; clear any pagination cursor left by a previous call.
+	delete(filters, "id_gt")
+
+	if startID > 0 {
+		filters["id_gt"] = []string{strconv.Itoa(startID)}
+	}
+
+	return query(ctx, now, filters)
+}
+
 // writeDecisions streams the decisions returned by query into the array the caller has already
 // opened, paginating by id from startID. A startup resync passes 0, a stream delta passes the
 // bouncer cursor: both are the same query, they only differ in where they start.
-func writeDecisions(gctx *gin.Context, now time.Time, filters map[string][]string, startID int, limit int, query func(context.Context, time.Time, map[string][]string) ([]*ent.Decision, error)) error {
+// firstPage holds the result of the page query at startID, fetched by the caller before the
+// response started; it lets the caller report a query failure before anything is streamed.
+func writeDecisions(gctx *gin.Context, now time.Time,
+	filters map[string][]string, startID int, limit int, query decisionsQuery, firstPage []*ent.Decision,
+) error {
 	needComma := false
 	lastId := startID
 
@@ -173,15 +195,21 @@ func writeDecisions(gctx *gin.Context, now time.Time, filters map[string][]strin
 	// callers reuse the same filters map across calls; clear any pagination cursor left by a previous call.
 	delete(filters, "id_gt")
 
-	for {
-		if lastId > 0 {
-			lastIdStr := strconv.Itoa(lastId)
-			filters["id_gt"] = []string{lastIdStr}
-		}
+	data := firstPage
 
-		data, err := query(ctx, now, filters)
-		if err != nil {
-			return err
+	for {
+		if data == nil {
+			if lastId > 0 {
+				lastIdStr := strconv.Itoa(lastId)
+				filters["id_gt"] = []string{lastIdStr}
+			}
+
+			var err error
+
+			data, err = query(ctx, now, filters)
+			if err != nil {
+				return err
+			}
 		}
 
 		for _, d := range data {
@@ -220,21 +248,58 @@ func writeDecisions(gctx *gin.Context, now time.Time, filters map[string][]strin
 
 			break
 		}
+
+		data = nil
 	}
 
 	return nil
 }
 
 func (c *Controller) streamDecisions(gctx *gin.Context, bouncerInfo *ent.Bouncer, now time.Time, filters map[string][]string, cursor int, startup bool) error {
+	// Expired decisions. Unlike the active ones these are keyed on until, not on the cursor:
+	// a decision expires when the clock passes it, with no write to order against.
+	expired := c.DBClient.QueryExpiredDecisionsWithFilters
+
+	expiredSince := (*time.Time)(nil)
+
+	if !startup {
+		// Use a 2-second overlap to avoid missing decisions that expired around the last pull time
+		if bouncerInfo.LastPull != nil {
+			since := bouncerInfo.LastPull.Add(-2 * time.Second)
+			expiredSince = &since
+		}
+	}
+
+	// Query both first pages before committing the response. Once the 200 and the opening
+	// bracket are on the wire, a database failure can no longer be reported with a status
+	// code: bouncers treat any parseable {"new": ..., "deleted": ...} document as a
+	// successful authoritative snapshot, so a failure past this point must leave the
+	// document incomplete instead of closing it as a valid empty one (#4691).
+	firstNew, err := firstDecisionsPage(gctx.Request.Context(), now, filters, cursor, c.DecisionsStreamPageSize, c.DBClient.QueryAllDecisionsWithFilters)
+	if err != nil {
+		return err
+	}
+
+	if expiredSince != nil {
+		since := expiredSince
+		expired = func(ctx context.Context, now time.Time, filters map[string][]string) ([]*ent.Decision, error) {
+			return c.DBClient.QueryExpiredDecisionsSinceWithFilters(ctx, now, since, filters)
+		}
+	}
+
+	firstExpired, err := firstDecisionsPage(gctx.Request.Context(), now, filters, 0, c.DecisionsStreamPageSize, expired)
+	if err != nil {
+		return err
+	}
+
 	gctx.Writer.Header().Set("Content-Type", "application/json")
 	gctx.Writer.Header().Set("Transfer-Encoding", "chunked")
 	gctx.Writer.WriteHeader(http.StatusOK)
 	gctx.Writer.WriteString(`{"new": [`) // No need to check for errors, the doc says it always returns nil
 
 	// Active decisions. A startup resync is this same query with a zero cursor.
-	if err := writeDecisions(gctx, now, filters, cursor, c.DecisionsStreamPageSize, c.DBClient.QueryAllDecisionsWithFilters); err != nil {
+	if err := writeDecisions(gctx, now, filters, cursor, c.DecisionsStreamPageSize, c.DBClient.QueryAllDecisionsWithFilters, firstNew); err != nil {
 		log.Errorf("failed sending new decisions: %v", err)
-		gctx.Writer.WriteString(`], "deleted": []}`)
 		gctx.Writer.Flush()
 
 		return err
@@ -242,26 +307,8 @@ func (c *Controller) streamDecisions(gctx *gin.Context, bouncerInfo *ent.Bouncer
 
 	gctx.Writer.WriteString(`], "deleted": [`)
 
-	// Expired decisions. Unlike the active ones these are keyed on until, not on the cursor:
-	// a decision expires when the clock passes it, with no write to order against.
-	expired := c.DBClient.QueryExpiredDecisionsWithFilters
-
-	if !startup {
-		// Use a 2-second overlap to avoid missing decisions that expired around the last pull time
-		var expiredSince *time.Time
-		if bouncerInfo.LastPull != nil {
-			since := bouncerInfo.LastPull.Add(-2 * time.Second)
-			expiredSince = &since
-		}
-
-		expired = func(ctx context.Context, now time.Time, filters map[string][]string) ([]*ent.Decision, error) {
-			return c.DBClient.QueryExpiredDecisionsSinceWithFilters(ctx, now, expiredSince, filters)
-		}
-	}
-
-	if err := writeDecisions(gctx, now, filters, 0, c.DecisionsStreamPageSize, expired); err != nil {
+	if err := writeDecisions(gctx, now, filters, 0, c.DecisionsStreamPageSize, expired, firstExpired); err != nil {
 		log.Errorf("failed sending expired decisions: %v", err)
-		gctx.Writer.WriteString(`]}`)
 		gctx.Writer.Flush()
 
 		return err
@@ -318,11 +365,20 @@ func (c *Controller) StreamDecision(gctx *gin.Context) {
 
 	err = c.streamDecisions(gctx, bouncerInfo, streamStartTime, filters, cursor, startup)
 
-	if err == nil {
-		// Only update the pull state if no error occurred when sending the decisions to avoid missing decisions
-		// Do not reuse the context provided by gin because we already have sent the response to the client, so there's a chance for it to already be canceled
-		if err := c.DBClient.UpdateBouncerStreamPull(context.Background(), streamStartTime, latestID, bouncerInfo.ID); err != nil {
-			log.Errorf("unable to update bouncer '%s' pull: %v", bouncerInfo.Name, err)
+	if err != nil {
+		// A failure before the response was committed is reported the same way as the
+		// non-streaming endpoint; one that happened mid-stream has already truncated the
+		// document, and the cursor is left untouched so the next pull retries the same window.
+		if !gctx.Writer.Written() {
+			c.HandleDBErrors(gctx, err)
 		}
+
+		return
+	}
+
+	// Only update the pull state if no error occurred when sending the decisions to avoid missing decisions
+	// Do not reuse the context provided by gin because we already have sent the response to the client, so there's a chance for it to already be canceled
+	if err := c.DBClient.UpdateBouncerStreamPull(context.Background(), streamStartTime, latestID, bouncerInfo.ID); err != nil {
+		log.Errorf("unable to update bouncer '%s' pull: %v", bouncerInfo.Name, err)
 	}
 }
