@@ -8,10 +8,12 @@ package challenge
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 
+	"github.com/crowdsecurity/crowdsec/pkg/appsec/cookie"
 	"github.com/crowdsecurity/crowdsec/pkg/logging"
 )
 
@@ -41,6 +43,22 @@ type Config struct {
 	// the sealed cookie, not key eviction) so cookies can be long-lived while
 	// per-epoch keys rotate tightly. Defaults to 12h.
 	CookieTTL *time.Duration `yaml:"cookie_ttl"`
+
+	// CookieSameSite overrides the challenge cookies' SameSite attribute
+	// (lax, strict or none). The default, lax, works for top-level navigation
+	// but browsers reject lax cookies in a cross-site iframe, so an app
+	// embedded in an approved third-party page needs "none" for the challenge
+	// to clear there. SameSite=None requires the request to be https (the
+	// runtime refuses to mint a non-secure SameSite=None cookie).
+	CookieSameSite *string `yaml:"cookie_same_site"`
+
+	// CookiePartitioned opts the challenge cookies into CHIPS: the cookie is
+	// scoped to the top-level site doing the embedding, so clearance granted
+	// inside a cross-site iframe is not shared with other embedders. Requires
+	// cookie_same_site "none"; enabling it with lax/strict is a config error
+	// (a partitioned lax cookie is still rejected in the iframe, so the
+	// operator would get a challenge that can never clear). Defaults to false.
+	CookiePartitioned *bool `yaml:"cookie_partitioned"`
 
 	// CustomJSTimeout bounds the time all CUSTOM_JS detection hooks get, in
 	// total rather than each.
@@ -88,6 +106,12 @@ func (c *Config) MergeFrom(other *Config) {
 	}
 	if other.CookieTTL != nil {
 		c.CookieTTL = other.CookieTTL
+	}
+	if other.CookieSameSite != nil {
+		c.CookieSameSite = other.CookieSameSite
+	}
+	if other.CookiePartitioned != nil {
+		c.CookiePartitioned = other.CookiePartitioned
 	}
 	if other.CustomJSTimeout != nil {
 		c.CustomJSTimeout = other.CustomJSTimeout
@@ -145,6 +169,24 @@ func BuildOptions(c *Config, parent *log.Entry) ([]Option, error) {
 	if c.CookieTTL != nil {
 		opts = append(opts, WithCookieTTL(*c.CookieTTL))
 	}
+	if c.CookieSameSite != nil || c.CookiePartitioned != nil {
+		sameSite := ""
+		if c.CookieSameSite != nil {
+			sameSite = *c.CookieSameSite
+		}
+		partitioned := c.CookiePartitioned != nil && *c.CookiePartitioned
+		if partitioned && !strings.EqualFold(sameSite, cookie.SameSiteNone) {
+			return nil, fmt.Errorf(
+				"invalid challenge cookie settings: cookie_partitioned requires cookie_same_site %q (a partitioned %q cookie is still rejected in a cross-site iframe)",
+				cookie.SameSiteNone, sameSiteOrLax(sameSite))
+		}
+		switch strings.ToLower(sameSite) {
+		case "", strings.ToLower(cookie.SameSiteLax), strings.ToLower(cookie.SameSiteStrict), strings.ToLower(cookie.SameSiteNone):
+		default:
+			return nil, fmt.Errorf("invalid challenge cookie_same_site %q (expected lax, strict or none)", sameSite)
+		}
+		opts = append(opts, WithCookiePolicy(sameSite, partitioned))
+	}
 	if c.CustomJSTimeout != nil {
 		opts = append(opts, WithCustomJSTimeout(*c.CustomJSTimeout))
 	}
@@ -159,4 +201,13 @@ func BuildOptions(c *Config, parent *log.Entry) ([]Option, error) {
 	}
 
 	return opts, nil
+}
+
+// sameSiteOrLax returns the given SameSite mode, or "Lax" when empty, for
+// error messages that must name the effective mode rather than an empty one.
+func sameSiteOrLax(mode string) string {
+	if mode == "" {
+		return cookie.SameSiteLax
+	}
+	return mode
 }

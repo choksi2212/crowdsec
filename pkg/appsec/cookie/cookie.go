@@ -28,14 +28,15 @@ const (
 // and chain the builder methods below; the final String() call renders it
 // to a Set-Cookie-compatible string.
 type AppsecCookie struct {
-	Name         string
-	Expiration   int64
-	Val          string
-	PathVal      string
-	DomainName   string
-	SecureFlag   bool
-	HttpOnlyFlag bool
-	SameSiteMode string
+	Name            string
+	Expiration      int64
+	Val             string
+	PathVal         string
+	DomainName      string
+	SecureFlag      bool
+	HttpOnlyFlag    bool
+	SameSiteMode    string
+	PartitionedFlag bool
 }
 
 // NewAppsecCookie returns a cookie pre-populated with sensible defaults.
@@ -96,6 +97,15 @@ func (c *AppsecCookie) HttpOnly() *AppsecCookie {
 	return c
 }
 
+// Partitioned marks the cookie Partitioned (CHIPS). The cookie is then scoped
+// to the top-level site doing the embedding, so challenge clearance granted
+// inside a cross-site iframe stays valid there without third-party cookies.
+// Requires Secure (enforced in String, like SameSite=None).
+func (c *AppsecCookie) Partitioned() *AppsecCookie {
+	c.PartitionedFlag = true
+	return c
+}
+
 // SameSite sets the SameSite mode (Lax / Strict / None). Unknown values are
 // passed through verbatim; validation happens on String() rendering.
 func (c *AppsecCookie) SameSite(mode string) *AppsecCookie {
@@ -120,13 +130,14 @@ func (c *AppsecCookie) String() string {
 	c.withDefaults()
 
 	cookie := http.Cookie{
-		Name:     c.Name,
-		Value:    c.Val,
-		Path:     c.PathVal,
-		Domain:   c.DomainName,
-		Secure:   c.SecureFlag,
-		HttpOnly: c.HttpOnlyFlag,
-		SameSite: toSameSite(c.SameSiteMode),
+		Name:        c.Name,
+		Value:       c.Val,
+		Path:        c.PathVal,
+		Domain:      c.DomainName,
+		Secure:      c.SecureFlag,
+		HttpOnly:    c.HttpOnlyFlag,
+		SameSite:    toSameSite(c.SameSiteMode),
+		Partitioned: c.PartitionedFlag,
 	}
 
 	if c.Expiration > 0 {
@@ -135,7 +146,8 @@ func (c *AppsecCookie) String() string {
 	}
 
 	// SameSite=None requires Secure=true per modern browsers; enforce to avoid invalid cookies.
-	if cookie.SameSite == http.SameSiteNoneMode && !cookie.Secure {
+	// Partitioned (CHIPS) requires Secure too, for the same reason.
+	if (cookie.SameSite == http.SameSiteNoneMode || cookie.Partitioned) && !cookie.Secure {
 		cookie.Secure = true
 	}
 

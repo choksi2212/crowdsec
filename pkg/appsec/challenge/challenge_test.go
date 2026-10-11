@@ -779,7 +779,7 @@ func TestValidateChallengeResponse_MalformedR(t *testing.T) {
 func TestChallengePageChecksCookiesEnabled(t *testing.T) {
 	for _, want := range []string{
 		"navigator.cookieEnabled",
-		`document.cookie = "__crowdsec_cookie_test=1; path=/; SameSite=Lax"`,
+		`document.cookie = "__crowdsec_cookie_test=1; path=/; SameSite={{.CookieSameSite}}"`,
 		"Cookies are disabled",
 	} {
 		require.Contains(t, htmlTemplate, want)

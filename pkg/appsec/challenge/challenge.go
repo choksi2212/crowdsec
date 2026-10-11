@@ -183,6 +183,14 @@ type ChallengeRuntime struct {
 	// fingerprint envelope. Defaults to MaxCookieLen (the browser limit).
 	maxCookieLen int
 
+	// cookieSameSite / cookiePartitioned are the attributes every sealed
+	// challenge cookie carries (see Config.CookieSameSite / CookiePartitioned).
+	// Defaults: lax, not partitioned. "none" (+ partitioned) is the opt-in for
+	// apps embedded in a cross-site iframe: browsers reject lax/strict cookies
+	// there, so the challenge could never clear without it.
+	cookieSameSite    string
+	cookiePartitioned bool
+
 	// htmlTpl is the challenge HTML template, parsed once and reused so
 	// GetChallengePage doesn't re-parse per request.
 	htmlTpl *template.Template
@@ -211,6 +219,8 @@ type runtimeOptions struct {
 	spentSetMaxEntries        int
 	customJS                  string
 	customJSTimeout           time.Duration
+	cookieSameSite            string
+	cookiePartitioned         bool
 	logger                    *log.Entry // nil → default "challenge" sublogger
 	// skipPreWarm drops the constructor's synchronous obfuscation and the
 	// background pre-warmer. Only withoutPreWarm (challenge_test.go) sets it.
@@ -274,6 +284,19 @@ func WithCookieTTL(ttl time.Duration) Option {
 		if ttl > 0 {
 			o.cookieTTL = ttl
 		}
+	}
+}
+
+// WithCookiePolicy sets the SameSite attribute and Partitioned flag the
+// runtime stamps on every challenge cookie it seals. mode is one of lax,
+// strict or none (empty keeps the default, lax); partitioned requires none.
+// The cookie-support probe embedded in the challenge page mirrors mode too,
+// so the probe's throwaway cookie is rejected by the browser under the same
+// rules as the real one.
+func WithCookiePolicy(mode string, partitioned bool) Option {
+	return func(o *runtimeOptions) {
+		o.cookieSameSite = mode
+		o.cookiePartitioned = partitioned
 	}
 }
 
@@ -471,6 +494,11 @@ func NewChallengeRuntime(ctx context.Context, opts ...Option) (*ChallengeRuntime
 		maxCookieLen = MaxCookieLen
 	}
 
+	cookieSameSite := resolvedOpts.cookieSameSite
+	if cookieSameSite == "" {
+		cookieSameSite = cookie.SameSiteLax
+	}
+
 	cryptoPoolSize := resolvedOpts.cryptoObfuscationPoolSize
 	if cryptoPoolSize <= 0 {
 		cryptoPoolSize = cryptoObfuscationPoolDefaultSize
@@ -514,6 +542,8 @@ func NewChallengeRuntime(ctx context.Context, opts ...Option) (*ChallengeRuntime
 		dynamicModuleCache: make(map[int64][]string),
 		cookieTTL:          cookieTTL,
 		maxCookieLen:       maxCookieLen,
+		cookieSameSite:     cookieSameSite,
+		cookiePartitioned:  resolvedOpts.cookiePartitioned,
 		htmlTpl:            htmlTpl,
 		spent:              newSpentSet(spentSetMaxEntries),
 		customJSTimeout:    customJSTimeout,
@@ -554,6 +584,12 @@ func NewChallengeRuntime(ctx context.Context, opts ...Option) (*ChallengeRuntime
 		"max_cookie_len":    maxCookieLen,
 		"pow_difficulty":    defaultPowDifficulty,
 		"crypto_pool_size":  cryptoPoolSize,
+	}
+	if resolvedOpts.cookieSameSite != "" || resolvedOpts.cookiePartitioned {
+		fields["cookie_same_site"] = cookieSameSite
+		if resolvedOpts.cookiePartitioned {
+			fields["cookie_partitioned"] = true
+		}
 	}
 
 	// Only with a script loaded: the timeout bounds nothing without hooks, and an
@@ -657,6 +693,7 @@ func (c *ChallengeRuntime) GetChallengePage(ctx context.Context, userAgent strin
 		"PowMAC":            powMAC,
 		"Timestamp":         ts,
 		"R":                 r,
+		"CookieSameSite":    c.cookieSameSite,
 	}); err != nil {
 		return "", fmt.Errorf("render challenge page: %w", err)
 	}
@@ -796,12 +833,26 @@ func (c *ChallengeRuntime) ValidateChallengeResponse(request *http.Request, body
 		return nil, FingerprintData{}, 0, fmt.Errorf("failed to seal challenge cookie: %w", err)
 	}
 
-	ck := cookie.NewAppsecCookie(ChallengeCookieName).HttpOnly().Path("/").SameSite(cookie.SameSiteLax).ExpiresIn(c.cookieTTL).Value(cookieValue)
+	ck := c.stampCookiePolicy(cookie.NewAppsecCookie(ChallengeCookieName).HttpOnly().Path("/").ExpiresIn(c.cookieTTL).Value(cookieValue), request)
 	if request.URL.Scheme == "https" {
 		ck = ck.Secure()
 	}
 
 	return ck, fpData, clientDifficulty, nil
+}
+
+// stampCookiePolicy applies the configured SameSite mode (and Partitioned
+// flag) to a freshly sealed challenge cookie. SameSite=None requires Secure;
+// the caller stamps Secure for https requests, and the builder promotes a
+// still-insecure cookie to Secure at render time, so a plain-http request
+// yields a valid Secure cookie the browser will only send back over https —
+// the same posture the Lax default already has there.
+func (c *ChallengeRuntime) stampCookiePolicy(ck *cookie.AppsecCookie, request *http.Request) *cookie.AppsecCookie {
+	ck = ck.SameSite(c.cookieSameSite)
+	if c.cookiePartitioned {
+		ck = ck.Partitioned()
+	}
+	return ck
 }
 
 // SealAllowlistCookie mints an allowlist-bypass cookie (no fingerprint, with
@@ -825,7 +876,7 @@ func (c *ChallengeRuntime) SealAllowlistCookie(request *http.Request, reason str
 		return nil, fmt.Errorf("failed to seal allowlist cookie: %w", err)
 	}
 
-	ck := cookie.NewAppsecCookie(ChallengeCookieName).HttpOnly().Path("/").SameSite(cookie.SameSiteLax).ExpiresIn(ttl).Value(cookieValue)
+	ck := c.stampCookiePolicy(cookie.NewAppsecCookie(ChallengeCookieName).HttpOnly().Path("/").ExpiresIn(ttl).Value(cookieValue), request)
 	if request.URL.Scheme == "https" {
 		ck = ck.Secure()
 	}
